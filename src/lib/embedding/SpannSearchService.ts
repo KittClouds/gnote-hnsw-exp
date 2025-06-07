@@ -4,6 +4,7 @@ import { blobToVec, vecToBlob } from './binaryUtils';
 import { embeddingService } from './EmbeddingService';
 import { Block } from '@blocknote/core';
 import { toast } from 'sonner';
+import { hnswPersistence } from './hnsw/persistence';
 
 interface Centroid {
   id: number;
@@ -46,11 +47,10 @@ function l2Normalize(v: Float32Array): Float32Array {
 }
 
 /**
- * Implements a SPANN-like hybrid search.
+ * Implements a SPANN-like hybrid search with OPFS persistence.
  * - An in-memory HNSW index holds a small number of centroids.
  * - The full vector dataset remains on "disk" in the SQLite database.
- * - Search is a two-step process: find candidate clusters in memory, then
- *   fetch and search vectors from only those clusters.
+ * - Graph structure is persisted to OPFS for fast startup.
  */
 class SpannSearchService {
   private storeRef: any = null;
@@ -62,12 +62,9 @@ class SpannSearchService {
   private centroidIndex: HNSW | null = null;
 
   constructor(private config = {
-    // How many clusters/centroids to partition the dataset into.
-    // Reduced from 100 to 5 for easier testing
     numClusters: 5,
-    // How many of the closest clusters to search during a query.
-    // Higher is more accurate but slower.
     searchProbeCount: 3,
+    snapshotInterval: 500, // Snapshot every N inserts
   }) {}
 
   /**
@@ -75,6 +72,8 @@ class SpannSearchService {
    */
   public setStore(store: any) {
     this.storeRef = store;
+    hnswPersistence.setStore(store);
+    
     if (!this.isInitialized && store) {
       this.initialize();
       this.isInitialized = true;
@@ -86,8 +85,9 @@ class SpannSearchService {
     try {
       await embeddingService.ready();
       await this.loadCentroidsFromDB();
+      await this.loadPersistedGraph();
       this.isReady = true;
-      console.log('SpannSearchService initialized');
+      console.log('SpannSearchService initialized with persistence');
       if (!this.centroidIndex) {
         console.warn('SPANN index is not built. Use "Sync & Rebuild Index" to create the index.');
       }
@@ -97,7 +97,7 @@ class SpannSearchService {
   }
 
   /**
-   * Loads ONLY the centroids from the database into the in-memory HNSW index.
+   * Loads centroids from database and attempts to restore graph from persistence
    */
   private async loadCentroidsFromDB() {
     if (!this.storeRef) return;
@@ -115,14 +115,53 @@ class SpannSearchService {
         vector: blobToVec(row.vecData, row.vecDim),
       }));
 
-      // Build the fast, in-memory index on the centroids
-      this.centroidIndex = new HNSW(16, 200, null, 'cosine');
-      const hnswData = this.centroids.map(c => ({ id: c.id, vector: c.vector }));
-      await this.centroidIndex.buildIndex(hnswData);
-
-      console.log(`SpannSearchService: Loaded ${this.centroids.length} centroids into memory`);
+      console.log(`SpannSearchService: Loaded ${this.centroids.length} centroids from database`);
     } catch (error) {
       console.error('Failed to load centroids from database:', error);
+    }
+  }
+
+  /**
+   * Attempts to load persisted HNSW graph from OPFS
+   */
+  private async loadPersistedGraph() {
+    if (this.centroids.length === 0) return;
+
+    try {
+      const persistedGraph = await hnswPersistence.loadLatestGraph();
+      
+      if (persistedGraph && persistedGraph.nodes.size > 0) {
+        // Restore vectors to the graph nodes from our centroids
+        for (const centroid of this.centroids) {
+          const node = persistedGraph.nodes.get(centroid.id);
+          if (node) {
+            node.vector = centroid.vector;
+          }
+        }
+        
+        this.centroidIndex = persistedGraph;
+        console.log(`SpannSearchService: Restored graph from persistence with ${persistedGraph.nodes.size} nodes`);
+      } else {
+        console.log('SpannSearchService: No valid persisted graph found, will build fresh index');
+      }
+    } catch (error) {
+      console.error('SpannSearchService: Failed to load persisted graph:', error);
+    }
+  }
+
+  /**
+   * Persists the current HNSW graph to OPFS
+   */
+  private async persistGraph() {
+    if (!this.centroidIndex || this.centroidIndex.nodes.size === 0) {
+      console.log('SpannSearchService: No graph to persist');
+      return;
+    }
+
+    try {
+      await hnswPersistence.persistGraph(this.centroidIndex);
+    } catch (error) {
+      console.error('SpannSearchService: Failed to persist graph:', error);
     }
   }
 
@@ -226,13 +265,13 @@ class SpannSearchService {
   }
 
   /**
-   * The new, authoritative "sync and rebuild" process with enhanced cleanup.
+   * The new, authoritative "sync and rebuild" process with enhanced cleanup and persistence.
    */
   public async buildIndex() {
     if (!this.storeRef || !this.isReady) {
       throw new Error("SpannSearchService is not ready.");
     }
-    console.log("SPANN: Starting enhanced sync and rebuild process.");
+    console.log("SPANN: Starting enhanced sync and rebuild process with persistence.");
 
     // --- Phase 1: Enhanced Stale Embedding Cleanup ---
     console.log("SPANN: Phase 1 - Enhanced stale embedding cleanup");
@@ -271,7 +310,7 @@ class SpannSearchService {
     }
 
     // --- Phase 3: Rebuild the SPANN Index ---
-    console.log("SPANN: Phase 3 - Rebuilding SPANN index");
+    console.log("SPANN: Phase 3 - Rebuilding SPANN index with persistence");
     
     const allEmbeddingsResult = this.storeRef.query(tables.embeddings.select());
     const allEmbeddings = Array.isArray(allEmbeddingsResult) ? allEmbeddingsResult : [];
@@ -312,7 +351,15 @@ class SpannSearchService {
 
     // Reload centroids and build in-memory index
     await this.loadCentroidsFromDB();
-    if (!this.centroidIndex) throw new Error("Failed to build centroid index after sync.");
+    if (!this.centroidIndex) {
+      // Build fresh index
+      this.centroidIndex = new HNSW(16, 200, null, 'cosine');
+      const hnswData = this.centroids.map(c => ({ id: c.id, vector: c.vector }));
+      await this.centroidIndex.buildIndex(hnswData);
+      
+      // Persist the new graph
+      await this.persistGraph();
+    }
 
     // Assign each embedding to its nearest cluster
     console.log(`SPANN: Assigning ${allEmbeddings.length} embeddings to ${this.centroids.length} clusters.`);
@@ -333,6 +380,9 @@ class SpannSearchService {
       this.storeRef.commit(events.embeddingsAssignedToCluster({ clusterId, noteIds }));
     }
 
+    // Clean up old snapshots
+    await hnswPersistence.gcOldSnapshots(2);
+
     // Final verification
     const finalEmbeddingCount = this.storeRef.query(tables.embeddings.count()) || 0;
     const finalNoteCount = this.storeRef.query(tables.notes.count()) || 0;
@@ -343,7 +393,7 @@ class SpannSearchService {
       console.warn(`SPANN: Warning - More embeddings (${finalEmbeddingCount}) than notes (${finalNoteCount}). Some stale data may remain.`);
     }
 
-    console.log(`SPANN: Enhanced sync and rebuild complete. Synced ${syncedCount} notes, cleaned ${cleanupResult.removed} stale embeddings.`);
+    console.log(`SPANN: Enhanced sync and rebuild complete with persistence. Synced ${syncedCount} notes, cleaned ${cleanupResult.removed} stale embeddings.`);
     return this.centroids.length;
   }
 
@@ -359,7 +409,6 @@ class SpannSearchService {
       }
 
       // Phase 1: In-Memory Search
-      // Find the most relevant clusters by searching the small centroid index
       const { vector: queryVector } = await embeddingService.embed([`search_query: ${query}`]);
       const normalizedQueryVector = l2Normalize(queryVector);
       
@@ -368,7 +417,6 @@ class SpannSearchService {
       if (candidateClusters.length === 0) return [];
 
       // Phase 2: Disk Search
-      // For each candidate cluster, fetch all embeddings with that clusterId
       const allCandidateEmbeddings: any[] = [];
       
       for (const cluster of candidateClusters) {
@@ -409,9 +457,7 @@ class SpannSearchService {
   }
 
   /**
-   * Adds or updates a single note's embedding. For this simplified model,
-   * we add it to the database without a cluster assignment. It will be
-   * properly clustered during the next full buildIndex run.
+   * Adds or updates a single note's embedding.
    */
   public async addOrUpdateNote(noteId: string, title: string, content: Block[]) {
     try {
@@ -437,6 +483,11 @@ class SpannSearchService {
           updatedAt: new Date().toISOString(),
           clusterId: null // This embedding is now "unclustered"
         }));
+
+        // Optionally trigger incremental graph update if we have enough nodes
+        if (this.centroidIndex && this.centroidIndex.nodes.size >= this.config.snapshotInterval) {
+          await this.persistGraph();
+        }
       }
     } catch (error) {
       console.error('Failed to embed note:', error);
@@ -516,6 +567,10 @@ class SpannSearchService {
 
   public isIndexBuilt(): boolean {
     return this.centroidIndex !== null && this.centroids.length > 0;
+  }
+
+  public async getSnapshotInfo() {
+    return await hnswPersistence.getSnapshotInfo();
   }
 }
 

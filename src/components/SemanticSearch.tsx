@@ -4,7 +4,7 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { ScrollArea } from '@/components/ui/scroll-area';
-import { Search, Loader2, Database, Building, Trash2 } from 'lucide-react';
+import { Search, Loader2, Database, Building, Trash2, HardDrive } from 'lucide-react';
 import { useDebouncedCallback } from '@/hooks/useDebouncedCallback';
 import { spannSearchService } from '@/lib/embedding/SpannSearchService';
 import { useActiveNoteId, useNotes } from '@/hooks/useLiveStore';
@@ -24,6 +24,7 @@ export function SemanticSearch() {
   const [isSearching, setIsSearching] = useState(false);
   const [isSyncingAndRebuilding, setIsSyncingAndRebuilding] = useState(false);
   const [isCleaningUp, setIsCleaningUp] = useState(false);
+  const [snapshotInfo, setSnapshotInfo] = useState<{ count: number; latestDate?: Date; totalSize?: number }>({ count: 0 });
   const [, setActiveNoteId] = useActiveNoteId();
   const notes = useNotes();
   
@@ -31,6 +32,20 @@ export function SemanticSearch() {
   const embeddings = useEmbeddings();
   const embeddingCount = useEmbeddingCount();
   const clustersCount = useEmbeddingClustersCount();
+
+  // Load snapshot info on mount and after operations
+  const loadSnapshotInfo = useCallback(async () => {
+    try {
+      const info = await spannSearchService.getSnapshotInfo();
+      setSnapshotInfo(info);
+    } catch (error) {
+      console.error('Failed to load snapshot info:', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadSnapshotInfo();
+  }, [loadSnapshotInfo]);
 
   const handleSearch = useDebouncedCallback(async (searchQuery: string) => {
     if (!searchQuery.trim()) {
@@ -66,26 +81,28 @@ export function SemanticSearch() {
       }
       
       console.log('Cleanup result:', result);
+      await loadSnapshotInfo(); // Refresh snapshot info
     } catch (error) {
       console.error('Force cleanup failed:', error);
       toast.error('Failed to cleanup stale embeddings');
     } finally {
       setIsCleaningUp(false);
     }
-  }, []);
+  }, [loadSnapshotInfo]);
 
   const handleSyncAndRebuildIndex = useCallback(async () => {
     setIsSyncingAndRebuilding(true);
     try {
       const centroidCount = await spannSearchService.buildIndex();
       toast.success(`Sync & rebuild complete! Built index with ${centroidCount} clusters`);
+      await loadSnapshotInfo(); // Refresh snapshot info after rebuild
     } catch (error) {
       console.error('Sync and rebuild failed:', error);
       toast.error(error instanceof Error ? error.message : 'Failed to sync and rebuild index');
     } finally {
       setIsSyncingAndRebuilding(false);
     }
-  }, []);
+  }, [loadSnapshotInfo]);
 
   const handleSelectNote = (noteId: string) => {
     setActiveNoteId(noteId);
@@ -94,6 +111,14 @@ export function SemanticSearch() {
   const isIndexBuilt = spannSearchService.isIndexBuilt();
   const minEmbeddingsRequired = 3;
   const hasStaleData = embeddingCount > notes.length;
+
+  const formatBytes = (bytes: number) => {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  };
 
   return (
     <div className="p-4 flex flex-col h-full">
@@ -170,6 +195,24 @@ export function SemanticSearch() {
                 </Badge>
               )}
             </div>
+            
+            {/* Graph persistence status */}
+            <div className="flex items-center justify-between">
+              <div className="flex items-center">
+                <HardDrive className="h-3 w-3 mr-1" />
+                <span>{snapshotInfo.count} snapshots</span>
+              </div>
+              {snapshotInfo.totalSize && (
+                <span>{formatBytes(snapshotInfo.totalSize)}</span>
+              )}
+            </div>
+            
+            {snapshotInfo.latestDate && (
+              <div className="text-center text-xs">
+                Last: {snapshotInfo.latestDate.toLocaleString()}
+              </div>
+            )}
+            
             <div className="text-center">
               {isIndexBuilt ? (
                 <Badge variant="secondary" className="text-xs">Index Ready</Badge>

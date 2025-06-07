@@ -108,6 +108,16 @@ export const tables = {
     }
   }),
 
+  // NEW: HNSW graph snapshots metadata table
+  hnswSnapshots: State.SQLite.table({
+    name: 'hnsw_graph_snapshots',
+    columns: {
+      fileName: State.SQLite.text({ primaryKey: true }),
+      checksum: State.SQLite.text(),
+      createdAt: State.SQLite.integer({ schema: Schema.DateFromNumber })
+    }
+  }),
+
   graphNodes: State.SQLite.table({
     name: 'graphNodes',
     columns: {
@@ -287,6 +297,23 @@ export const events = {
     name: 'v1.EmbeddingRemoved',
     schema: Schema.Struct({
       noteId: Schema.String
+    })
+  }),
+
+  // NEW: HNSW graph snapshot events
+  hnswGraphSnapshotCreated: Events.synced({
+    name: 'v1.HnswGraphSnapshotCreated',
+    schema: Schema.Struct({
+      fileName: Schema.String,
+      checksum: Schema.String,
+      createdAt: Schema.DateFromNumber
+    })
+  }),
+
+  hnswSnapshotDeleted: Events.synced({
+    name: 'v1.HnswSnapshotDeleted',
+    schema: Schema.Struct({
+      fileName: Schema.String
     })
   }),
 
@@ -542,6 +569,13 @@ const materializers = State.SQLite.materializers(events, {
 
   'v1.EmbeddingRemoved': ({ noteId }) =>
     tables.embeddings.delete().where({ noteId }),
+
+  // NEW: HNSW snapshot materializers
+  'v1.HnswGraphSnapshotCreated': ({ fileName, checksum, createdAt }) =>
+    tables.hnswSnapshots.insert({ fileName, checksum, createdAt }),
+
+  'v1.HnswSnapshotDeleted': ({ fileName }) =>
+    tables.hnswSnapshots.delete().where({ fileName }),
 
   // Thread materializers
   'v1.ThreadCreated': ({ id, title, createdAt, updatedAt }) =>
